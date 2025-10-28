@@ -1,0 +1,159 @@
+
+═══════════════════════════════════════════════════════════════════════
+   SIMPLE FLOW: How "pip install rich" Persists Across Restarts
+═══════════════════════════════════════════════════════════════════════
+
+
+STEP 1: Installation
+─────────────────────
+
+  $ pip install rich
+         │
+         ├──> Python writes files to:
+         │    /usr/local/lib/python3.11/dist-packages/rich/
+         │
+         └──> These writes become syscalls:
+              open(), write(), close()
+
+
+STEP 2: Syscalls Travel Through Layers
+────────────────────────────────────────
+
+  Container Process (pip)
+         │
+         │ write() syscall
+         ▼
+  ┌─────────────────────────┐
+  │ gVisor Application      │  ← Intercepts syscall
+  │ Kernel (in userspace)   │     (not real Linux kernel!)
+  └─────────────────────────┘
+         │
+         │ Translates to 9p protocol
+         ▼
+  ┌─────────────────────────┐
+  │ File Descriptor 4       │  ← Communication channel
+  │ (9p connection)         │     to host
+  └─────────────────────────┘
+         │
+         │ 9p messages
+         ▼
+  ┌─────────────────────────┐
+  │ HOST: gVisor Gofer      │  ← Runs on host, not container!
+  │ (9p server)             │     Has access to real filesystem
+  └─────────────────────────┘
+         │
+         │ Actual filesystem operations
+         ▼
+  ┌──────────────────────────────────────┐
+  │ Host Storage:                        │
+  │ /sessions/session_011CUY4k.../       │
+  │   usr/local/lib/python3.11/          │
+  │     dist-packages/rich/  ✓           │
+  └──────────────────────────────────────┘
+
+
+STEP 3: process_api Ensures Durability
+────────────────────────────────────────
+
+  ┌─────────────────────────┐
+  │ process_api (Rust)      │
+  │ Monitors filesystem     │
+  └─────────────────────────┘
+         │
+         │ Detects: files created in dist-packages/
+         ▼
+  println!("[CONTROL] Syncing filesystem...")
+         │
+         │ Calls fsync() on directory
+         ▼
+  ┌─────────────────────────┐
+  │ fsync() → 9p → gofer    │  ← Force flush to disk
+  │ → Host storage flush    │
+  └─────────────────────────┘
+         │
+         │ Wait for completion
+         ▼
+  println!("[CONTROL] Filesystem sync completed successfully")
+
+
+STEP 4: Container Restarts (After 20 min Timeout)
+───────────────────────────────────────────────────
+
+  Old Container Dies
+         │
+         ▼
+  ┌─────────────────────────────────────┐
+  │ Kubernetes/gVisor                   │
+  │ "Start new container with           │
+  │  session: session_011CUY4k..."      │
+  └─────────────────────────────────────┘
+         │
+         │ Same session ID!
+         ▼
+  ┌─────────────────────────────────────┐
+  │ gVisor Gofer                        │
+  │ "Mount SAME storage directory       │
+  │  via 9p on file descriptors 4/5"    │
+  └─────────────────────────────────────┘
+         │
+         │ 9p mount
+         ▼
+  New Container Sees:
+    /usr/local/lib/python3.11/dist-packages/rich/  ✓
+    /home/user/wind-forecasting/.git/  ✓
+    /tmp/test-pip-persist.txt  ✓
+
+  Everything is still there!
+
+
+═══════════════════════════════════════════════════════════════════════
+                    KEY RUST CODE IN process_api
+═══════════════════════════════════════════════════════════════════════
+
+// 1. Monitor for file changes
+let inotify = Inotify::init()?;
+inotify.add_watch("/usr/local/lib", WatchMask::CREATE)?;
+
+// 2. When change detected:
+println!("[CONTROL] Syncing filesystem...");
+
+// 3. Force sync via syscall
+let file = File::open("/usr/local/lib/python3.11/dist-packages")?;
+fsync(file.as_raw_fd())?;  // ← This goes through 9p to host!
+
+// 4. Report success
+println!("[CONTROL] Filesystem sync completed successfully");
+
+
+═══════════════════════════════════════════════════════════════════════
+                         ANALOGY
+═══════════════════════════════════════════════════════════════════════
+
+Think of it like Google Docs:
+
+  Container = Your browser tab showing the document
+  9p protocol = WebSocket connection to Google servers
+  Host storage = Google's database
+  process_api = Auto-save feature that ensures edits are saved
+
+When you type in Google Docs:
+  1. Text appears locally (fast)
+  2. Changes sent to server (auto-save)
+  3. "All changes saved" appears
+
+When you close the tab and reopen:
+  - Your changes are still there!
+  - Because auto-save persisted them to the server
+
+Same here:
+  1. pip writes files locally (fast)
+  2. process_api syncs via 9p to host (durable)
+  3. "[CONTROL] Filesystem sync completed successfully"
+
+When container restarts:
+  - Your pip packages are still there!
+  - Because process_api persisted them to host storage
+
+
+═══════════════════════════════════════════════════════════════════════
+
