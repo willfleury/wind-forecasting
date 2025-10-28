@@ -1,3 +1,6 @@
 .ipynb_checkpoints/
 .DS_Store
 data/observations/
+node_modules/
+package.json
+package-lock.json
